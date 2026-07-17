@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package ratelimiter;
+
+option go_package = "github.com/sakthivel-p-cse/crdt-rate-limiter/proto";
+
+service RateLimiter {
+  // Existing client-facing Allow check
+  rpc Allow(AllowRequest) returns (AllowResponse);
+
+  // Gossip/membership endpoints
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc GossipState(GossipRequest) returns (GossipResponse);
+}
+
+message AllowRequest {
+  string client_id = 1;
+  int64 cost = 2;
+}
+
+message AllowResponse {
+  bool allowed = 1;
+  int64 remaining = 2;
+}
+
+message PingRequest {
+  string node_id = 1;
+  string listen_address = 2;
+}
+
+message PingResponse {
+  bool ack = 1;
+}
+
+message GossipRequest {
+  string source_node_id = 1;
+  // State is a map of client_id -> (epoch -> (node_id -> count))
+  // We can represent this efficiently. Let's use nested maps for simplicity.
+  map<string, ClientState> state = 2;
+}
+
+message ClientState {
+  map<int64, EpochState> epochs = 1;
+}
+
+message EpochState {
+  map<string, int64> node_counts = 1;
+}
+
+message GossipResponse {
+  bool success = 1;
+}
