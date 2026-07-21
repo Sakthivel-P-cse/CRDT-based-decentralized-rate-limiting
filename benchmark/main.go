@@ -15,6 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	pb "github.com/sakthivel-p-cse/crdt-rate-limiter/proto"
+	"github.com/sakthivel-p-cse/crdt-rate-limiter/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -174,6 +175,12 @@ func (r *BenchmarkResult) Print(name string, duration time.Duration) {
 	}
 	secs := duration.Seconds()
 	fmt.Printf("\n=== %s Benchmark Results ===\n", name)
+	if name == "Redis" || name == "redis" {
+		fmt.Println("NOTE: Redis baseline uses a FIXED-WINDOW centralized limiter.")
+		fmt.Println("      CRDT cluster uses a SLIDING-WINDOW decentralized limiter.")
+		fmt.Println("      This is NOT an apples-to-apples algorithmic comparison.")
+		fmt.Println("      Latency difference reflects both algorithm and network path differences.")
+	}
 	fmt.Printf("Duration: %.2fs\n", secs)
 	fmt.Printf("Total requests: %d\n", r.Total)
 	fmt.Printf("Allowed: %d (%.2f%%)\n", r.Allowed, float64(r.Allowed)/float64(r.Total)*100)
@@ -265,10 +272,10 @@ func (bc *BenchmarkClient) RunBenchmark(ctx context.Context, rps int, duration t
 	var wg sync.WaitGroup
 	requestCh := make(chan struct{}, rps*2)
 
-	// Request generator
 	wg.Add(1)
-	go func() {
+	go util.SafeGo("benchmark-request-generator", func() {
 		defer wg.Done()
+		defer close(requestCh)
 		ticker := time.NewTicker(time.Second / time.Duration(rps))
 		defer ticker.Stop()
 		deadline := time.Now().Add(duration)
@@ -286,22 +293,30 @@ func (bc *BenchmarkClient) RunBenchmark(ctx context.Context, rps int, duration t
 				}
 			}
 		}
-	}()
+	})
 
-	// Workers
 	numWorkers := 10
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		workerID := i
+		go util.SafeGo("benchmark-worker", func() {
 			defer wg.Done()
-			for range requestCh {
-				clientID := bc.clientIDs[workerID%len(bc.clientIDs)]
-				start := time.Now()
-				allowed, _, err := limiter.Allow(ctx, clientID, cost)
-				latency := time.Since(start).Seconds() * 1000
-				result.Add(allowed, latency, err)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case _, ok := <-requestCh:
+					if !ok {
+						return
+					}
+					clientID := bc.clientIDs[workerID%len(bc.clientIDs)]
+					start := time.Now()
+					allowed, _, err := limiter.Allow(ctx, clientID, cost)
+					latency := time.Since(start).Seconds() * 1000
+					result.Add(allowed, latency, err)
+				}
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -343,11 +358,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
+	go util.SafeGo("benchmark-signal-handler", func() {
 		<-sigCh
 		log.Println("Interrupted")
 		cancel()
-	}()
+	})
 
 	client, err := NewBenchmarkClient(*mode, *redisAddr, *nodeAddrs, *limit, *window, *clients)
 	if err != nil {

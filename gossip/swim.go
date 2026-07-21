@@ -2,18 +2,14 @@ package gossip
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/sakthivel-p-cse/crdt-rate-limiter/util"
 )
 
-// SWIM (Scalable Weakly-consistent Infection-style Membership) implements the
-// failure-detection and membership protocol.
-//
-// Each tick it selects up to k random alive peers (excluding itself), pings
-// each directly, and falls back to indirect pings via other peers if the direct
-// ping fails. Members that remain suspect for longer than suspectTimeout are
-// declared dead.
 type SWIM struct {
 	disseminator   *Disseminator
 	membership     *Membership
@@ -27,7 +23,6 @@ type SWIM struct {
 	wg             sync.WaitGroup
 }
 
-// NewSWIM constructs a SWIM failure detector.
 func NewSWIM(
 	disseminator *Disseminator,
 	membership *Membership,
@@ -52,59 +47,86 @@ func NewSWIM(
 	}
 }
 
-// Start launches the SWIM background goroutine.
 func (s *SWIM) Start(ctx context.Context) {
 	s.wg.Add(1)
-	go func() {
+	go util.SafeGo("swim-supervisor", func() {
 		defer s.wg.Done()
-		ticker := time.NewTicker(s.tickInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.tick(ctx)
+		util.SafeGoLoop("swim-tick-loop", ctx, func() {
+			ticker := time.NewTicker(s.tickInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					s.tick(ctx)
+				}
 			}
-		}
-	}()
+		})
+	})
 }
 
-// Stop waits for all in-flight SWIM goroutines to finish.
 func (s *SWIM) Stop() {
 	s.wg.Wait()
 }
 
 func (s *SWIM) tick(ctx context.Context) {
-	s.checkSuspects()
+	s.checkSuspects(ctx)
 
-	// Exclude self so we never ping ourselves.
 	peers := s.membership.GetRandomKAlive(s.k, s.nodeID)
 	for _, peer := range peers {
 		p := peer
 		s.wg.Add(1)
-		go func(peer *Member) {
+		go util.SafeGo("swim-ping-peer", func() {
 			defer s.wg.Done()
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				s.pingPeer(ctx, peer)
+				s.pingPeer(ctx, p)
 			}
-		}(p)
+		})
 	}
 }
 
-func (s *SWIM) pingPeer(ctx context.Context, peer *Member) {
+func (s *SWIM) membershipDigest() []Member {
+	all := s.membership.GetAll()
+	max := 2 * s.k
+	if len(all) <= max {
+		return all
+	}
+	return all[:max]
+}
+
+func (s *SWIM) mergeMemberDigest(digest []Member) {
+	for _, m := range digest {
+		if m.NodeID == "" || m.Address == "" {
+			continue
+		}
+		if m.NodeID == s.nodeID {
+			if m.Status != StatusAlive {
+				s.membership.Refute(s.nodeID, m.Incarnation)
+			}
+			continue
+		}
+		m2 := m
+		s.membership.Add(&m2)
+	}
+}
+
+func (s *SWIM) pingPeer(ctx context.Context, peer Member) {
 	pingCtx, cancel := context.WithTimeout(ctx, s.pingTimeout)
 	defer cancel()
 
-	ack, err := s.transport.Ping(pingCtx, peer.Address, s.nodeID, s.listenAddr)
+	digest := s.membershipDigest()
+	ack, respDigest, err := s.transport.Ping(pingCtx, peer.Address, s.nodeID, s.listenAddr, digest)
 	if err != nil || !ack {
 		slog.Debug("direct ping failed, trying indirect", "from", s.nodeID, "to", peer.Address, "err", err)
 		s.indirectPing(ctx, peer)
 		return
 	}
+
+	s.mergeMemberDigest(respDigest)
 
 	s.membership.Update(&Member{
 		NodeID:      peer.NodeID,
@@ -115,13 +137,15 @@ func (s *SWIM) pingPeer(ctx context.Context, peer *Member) {
 	})
 }
 
-func (s *SWIM) indirectPing(ctx context.Context, target *Member) {
+func (s *SWIM) indirectPing(ctx context.Context, target Member) {
 	intermediaries := s.membership.GetRandomKAlive(s.k, s.nodeID, target.NodeID)
 	for _, via := range intermediaries {
 		pingCtx, cancel := context.WithTimeout(ctx, s.pingTimeout)
-		ack, err := s.transport.Ping(pingCtx, via.Address, s.nodeID, s.listenAddr)
+		digest := s.membershipDigest()
+		ack, respDigest, err := s.transport.IndirectPing(pingCtx, via.Address, s.nodeID, s.listenAddr, digest, target)
 		cancel()
 		if err == nil && ack {
+			s.mergeMemberDigest(respDigest)
 			s.membership.Update(&Member{
 				NodeID:      target.NodeID,
 				Address:     target.Address,
@@ -135,36 +159,64 @@ func (s *SWIM) indirectPing(ctx context.Context, target *Member) {
 	s.membership.MarkSuspect(target.NodeID)
 }
 
-func (s *SWIM) checkSuspects() {
+func (s *SWIM) checkSuspects(ctx context.Context) {
 	for _, member := range s.membership.GetAll() {
 		if member.Status == StatusSuspect && time.Since(member.LastSeen) > s.suspectTimeout {
-			s.membership.ConfirmDead(member.NodeID)
+			pingCtx, cancel := context.WithTimeout(ctx, s.pingTimeout)
+			ack, respDigest, err := s.transport.Ping(pingCtx, member.Address, s.nodeID, s.listenAddr, s.membershipDigest())
+			cancel()
+			if err == nil && ack {
+				s.mergeMemberDigest(respDigest)
+				s.membership.Update(&Member{
+					NodeID:      member.NodeID,
+					Address:     member.Address,
+					Incarnation: member.Incarnation,
+					Status:      StatusAlive,
+					LastSeen:    time.Now(),
+				})
+				continue
+			}
+			s.membership.ConfirmDead(member.NodeID, StatusSuspect, member.Incarnation, member.LastSeen)
 		}
 	}
 }
 
-// Join contacts each seed address, announcing this node's presence.
-// It is best-effort: if all seeds are unreachable the node starts isolated.
 func (s *SWIM) Join(seeds []string) error {
+	var successes int
 	for _, addr := range seeds {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = s.transport.Ping(ctx, addr, s.nodeID, s.listenAddr)
+		digest := s.membershipDigest()
+		_, respDigest, err := s.transport.Ping(ctx, addr, s.nodeID, s.listenAddr, digest)
 		cancel()
+		if err != nil {
+			slog.Warn("SWIM Join: failed to ping seed", "seed", addr, "error", err)
+			continue
+		}
+		s.mergeMemberDigest(respDigest)
+		successes++
+	}
+	if len(seeds) > 0 && successes == 0 {
+		return fmt.Errorf("failed to join cluster: all %d seed nodes unreachable", len(seeds))
 	}
 	return nil
 }
 
-// Leave announces departure to all alive peers before shutting down.
 func (s *SWIM) Leave() {
 	var wg sync.WaitGroup
 	for _, peer := range s.membership.GetAlive() {
+		p := peer
+		if p.NodeID == s.nodeID {
+			continue
+		}
 		wg.Add(1)
-		go func(p *Member) {
+		go util.SafeGo("swim-leave-peer", func() {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, _ = s.transport.Ping(ctx, p.Address, s.nodeID, s.listenAddr)
-		}(peer)
+			if _, _, err := s.transport.Ping(ctx, p.Address, s.nodeID, s.listenAddr, nil); err != nil {
+				slog.Warn("SWIM Leave: failed to notify peer", "peer", p.NodeID, "address", p.Address, "error", err)
+			}
+		})
 	}
 	wg.Wait()
 	s.membership.Remove(s.nodeID)

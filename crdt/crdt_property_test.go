@@ -7,7 +7,6 @@ import (
 	"github.com/leanovate/gopter/prop"
 )
 
-// genGCounter is a gopter generator that produces random GCounters.
 func genGCounter() gopter.Gen {
 	return func(params *gopter.GenParameters) *gopter.GenResult {
 		c := NewGCounter()
@@ -19,12 +18,10 @@ func genGCounter() gopter.Gen {
 	}
 }
 
-// snapshot returns the current counts map for deep comparison.
 func snapshot(c *GCounter) map[string]int64 {
 	return c.Counts()
 }
 
-// cloneCounter creates a deep copy of c for property tests.
 func cloneCounter(c *GCounter) *GCounter {
 	out := NewGCounter()
 	for k, v := range c.Counts() {
@@ -50,7 +47,6 @@ func TestGCounter_Properties(t *testing.T) {
 	params.MinSuccessfulTests = 1000
 	props := gopter.NewProperties(params)
 
-	// Commutativity: merge(A, B) == merge(B, A)
 	props.Property("Commutativity", prop.ForAll(
 		func(a, b *GCounter) bool {
 			ab := cloneCounter(a)
@@ -62,7 +58,6 @@ func TestGCounter_Properties(t *testing.T) {
 		genGCounter(), genGCounter(),
 	))
 
-	// Associativity: merge(merge(A,B),C) == merge(A,merge(B,C))
 	props.Property("Associativity", prop.ForAll(
 		func(a, b, c *GCounter) bool {
 			left := cloneCounter(a)
@@ -79,7 +74,6 @@ func TestGCounter_Properties(t *testing.T) {
 		genGCounter(), genGCounter(), genGCounter(),
 	))
 
-	// Idempotency: merge(A, A) == A
 	props.Property("Idempotency", prop.ForAll(
 		func(a *GCounter) bool {
 			dup := cloneCounter(a)
@@ -89,7 +83,6 @@ func TestGCounter_Properties(t *testing.T) {
 		genGCounter(),
 	))
 
-	// Monotonic Growth: merge(A,B).Value() >= max(A.Value(), B.Value())
 	props.Property("Monotonic Growth", prop.ForAll(
 		func(a, b *GCounter) bool {
 			av, bv := a.Value(), b.Value()

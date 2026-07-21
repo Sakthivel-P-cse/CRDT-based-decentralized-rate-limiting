@@ -11,6 +11,7 @@ import (
 
 	"github.com/sakthivel-p-cse/crdt-rate-limiter/node"
 	pb "github.com/sakthivel-p-cse/crdt-rate-limiter/proto"
+	"github.com/sakthivel-p-cse/crdt-rate-limiter/util"
 	"google.golang.org/grpc"
 )
 
@@ -22,17 +23,17 @@ func main() {
 	peerAddrs := parsePeers(peers)
 
 	cfg := node.Config{
-		NodeID:           nodeID,
-		ListenAddr:       listenAddr,
-		MetricsAddr:      metricsAddr,
-		Peers:            peerAddrs,
-		EpochSize:        1 * time.Second,
-		WindowSize:       60 * time.Second,
-		GossipInterval:   500 * time.Millisecond,
-		SuspectTimeout:   1 * time.Second,
-		PingTimeout:      2 * time.Second,
-		Fanout:           3,
-		RateLimit:        1000,
+		NodeID:         nodeID,
+		ListenAddr:     listenAddr,
+		MetricsAddr:    metricsAddr,
+		Peers:          peerAddrs,
+		EpochSize:      1 * time.Second,
+		WindowSize:     60 * time.Second,
+		GossipInterval: 500 * time.Millisecond,
+		SuspectTimeout: 1 * time.Second,
+		PingTimeout:    2 * time.Second,
+		Fanout:         3,
+		RateLimit:      1000,
 	}
 
 	server := node.NewRateLimiterServer(cfg)
@@ -49,22 +50,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		if err := server.Start(ctx); err != nil {
-			log.Printf("Server start error: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Printf("Starting RateLimiter server on %s", cfg.ListenAddr)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
-		}
-	}()
-
-	metricsServer := node.NewMetricsServer(cfg.NodeID, cfg.MetricsAddr)
-	if err := metricsServer.Start(); err != nil {
-		log.Printf("Metrics server start error: %v", err)
+	if err := startServing(ctx, server, grpcServer, lis); err != nil {
+		log.Fatalf("Server start error: %v", err)
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -75,10 +62,20 @@ func main() {
 	cancel()
 	server.Stop()
 	grpcServer.GracefulStop()
-	
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	metricsServer.Stop(shutdownCtx)
+}
+
+func startServing(ctx context.Context, server *node.RateLimiterServer, grpcServer *grpc.Server, lis net.Listener) error {
+	if err := server.Start(ctx); err != nil {
+		_ = lis.Close()
+		return err
+	}
+	go util.SafeGo("grpc-serve", func() {
+		log.Printf("Starting RateLimiter server on %s", lis.Addr())
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Printf("failed to serve: %v", err)
+		}
+	})
+	return nil
 }
 
 func getEnv(key, defaultValue string) string {

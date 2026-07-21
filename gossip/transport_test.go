@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-// MockServer for testing transport
 type MockServer struct {
 	pb.UnimplementedRateLimiterServer
 	mu           sync.Mutex
@@ -51,7 +50,6 @@ func TestTransport_PingAndGossip(t *testing.T) {
 	}()
 	defer grpcServer.Stop()
 
-	// Give it a moment to start
 	time.Sleep(10 * time.Millisecond)
 
 	transport := NewTransport()
@@ -59,8 +57,7 @@ func TestTransport_PingAndGossip(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test Ping
-	ack, err := transport.Ping(ctx, addr, "test-node", "test-listen-addr")
+	ack, _, err := transport.Ping(ctx, addr, "test-node", "test-listen-addr", nil)
 	if err != nil {
 		t.Fatalf("ping failed: %v", err)
 	}
@@ -71,7 +68,6 @@ func TestTransport_PingAndGossip(t *testing.T) {
 		t.Fatalf("expected ping from test-node, got %s", mockSrv.LastPingNode())
 	}
 
-	// Test GossipState
 	success, err := transport.SendState(ctx, addr, &pb.GossipRequest{
 		SourceNodeId: "test-node",
 	})
