@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sakthivel-p-cse/crdt-rate-limiter/gossip"
 	"github.com/sakthivel-p-cse/crdt-rate-limiter/node"
 	pb "github.com/sakthivel-p-cse/crdt-rate-limiter/proto"
 	"google.golang.org/grpc"
@@ -34,7 +35,7 @@ func TestOvershootValidation(t *testing.T) {
 
 	runDuration := 3 * time.Second
 
-	convergenceRounds := 4
+	convergenceRounds := gossip.ConvergenceRounds
 	rawMaxOvershoot := int64(float64(numNodes) * float64(localRPS) * gossipInterval.Seconds() * float64(convergenceRounds))
 
 	fmt.Printf("\n=== TestOvershootValidation ===\n")

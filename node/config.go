@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -27,6 +28,8 @@ type Config struct {
 	Fanout int
 
 	RateLimit int64
+
+	SoftThresholdRatio float64
 }
 
 func (c *Config) Validate() error {
@@ -39,6 +42,9 @@ func (c *Config) Validate() error {
 
 	if c.RateLimit <= 0 {
 		return fmt.Errorf("RateLimit must be > 0")
+	}
+	if math.IsNaN(c.SoftThresholdRatio) || math.IsInf(c.SoftThresholdRatio, 0) || c.SoftThresholdRatio <= 0 || c.SoftThresholdRatio >= 1 {
+		return fmt.Errorf("SoftThresholdRatio must be finite, > 0, and < 1")
 	}
 	if c.EpochSize <= 0 {
 		return fmt.Errorf("EpochSize must be > 0")

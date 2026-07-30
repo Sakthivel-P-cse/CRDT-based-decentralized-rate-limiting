@@ -15,6 +15,11 @@ type StateProvider interface {
 	GenerateDelta(since time.Time) map[string]*pb.ClientState
 }
 
+type utilizationProvider interface {
+	UtilizationRatio() float64
+	UtilizationChanges() <-chan struct{}
+}
+
 type Disseminator struct {
 	mu       sync.Mutex
 	nodeID   string
@@ -57,14 +62,19 @@ func (d *Disseminator) Start(ctx context.Context) {
 	go util.SafeGo("dissemination-supervisor", func() {
 		defer d.wg.Done()
 		util.SafeGoLoop("dissemination-tick-loop", ctx, func() {
-			ticker := time.NewTicker(d.tickInterval)
-			defer ticker.Stop()
+			lastRound := time.Now()
+			timer := time.NewTimer(d.currentTickInterval())
+			defer timer.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
+				case <-timer.C:
 					d.disseminate(ctx)
+					lastRound = time.Now()
+					timer.Reset(d.currentTickInterval())
+				case <-d.utilizationChanges():
+					resetTimer(timer, time.Until(lastRound.Add(d.currentTickInterval())))
 				}
 			}
 		})
@@ -107,7 +117,7 @@ func (d *Disseminator) disseminate(ctx context.Context) {
 				return
 			default:
 
-				sendCtx, cancel := context.WithTimeout(ctx, 3*d.tickInterval)
+				sendCtx, cancel := context.WithTimeout(ctx, 3*d.currentTickInterval())
 				defer cancel()
 				d.sendToPeer(sendCtx, p, sendFull)
 			}
@@ -157,4 +167,33 @@ func (d *Disseminator) advanceLastSent(nodeID string, sendTime int64) {
 	if sendTime > d.lastSentNs[nodeID] {
 		d.lastSentNs[nodeID] = sendTime
 	}
+}
+
+func (d *Disseminator) currentTickInterval() time.Duration {
+	provider, ok := d.provider.(utilizationProvider)
+	if !ok {
+		return d.tickInterval
+	}
+	return GossipInterval(d.tickInterval, provider.UtilizationRatio())
+}
+
+func (d *Disseminator) utilizationChanges() <-chan struct{} {
+	provider, ok := d.provider.(utilizationProvider)
+	if !ok {
+		return nil
+	}
+	return provider.UtilizationChanges()
+}
+
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
 }

@@ -97,6 +97,16 @@ func (w *EpochWindow) Total(now time.Time) int64 {
 	return w.weightedTotal(now)
 }
 
+func (w *EpochWindow) ContributedInPreviousEpoch(nodeID string, now time.Time) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	counter := w.buckets[w.epochKey(now)-1]
+	if counter == nil {
+		return false
+	}
+	return counter.Counts()[nodeID] > 0
+}
+
 func (w *EpochWindow) Value(now time.Time) int64 {
 	return w.Total(now)
 }

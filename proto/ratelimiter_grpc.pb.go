@@ -17,7 +17,6 @@ const (
 
 type RateLimiterClient interface {
 	Allow(ctx context.Context, in *AllowRequest, opts ...grpc.CallOption) (*AllowResponse, error)
-
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 	GossipState(ctx context.Context, in *GossipRequest, opts ...grpc.CallOption) (*GossipResponse, error)
 }
@@ -62,7 +61,6 @@ func (c *rateLimiterClient) GossipState(ctx context.Context, in *GossipRequest, 
 
 type RateLimiterServer interface {
 	Allow(context.Context, *AllowRequest) (*AllowResponse, error)
-
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
 	GossipState(context.Context, *GossipRequest) (*GossipResponse, error)
 	mustEmbedUnimplementedRateLimiterServer()

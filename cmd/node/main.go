@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -21,19 +22,24 @@ func main() {
 	metricsAddr := getEnv("METRICS_ADDR", ":9090")
 	peers := getEnv("PEERS", "")
 	peerAddrs := parsePeers(peers)
+	softThresholdRatio, err := strconv.ParseFloat(getEnv("SOFT_THRESHOLD_RATIO", "0.70"), 64)
+	if err != nil {
+		log.Fatalf("invalid SOFT_THRESHOLD_RATIO: %v", err)
+	}
 
 	cfg := node.Config{
-		NodeID:         nodeID,
-		ListenAddr:     listenAddr,
-		MetricsAddr:    metricsAddr,
-		Peers:          peerAddrs,
-		EpochSize:      1 * time.Second,
-		WindowSize:     60 * time.Second,
-		GossipInterval: 500 * time.Millisecond,
-		SuspectTimeout: 1 * time.Second,
-		PingTimeout:    2 * time.Second,
-		Fanout:         3,
-		RateLimit:      1000,
+		NodeID:             nodeID,
+		ListenAddr:         listenAddr,
+		MetricsAddr:        metricsAddr,
+		Peers:              peerAddrs,
+		EpochSize:          1 * time.Second,
+		WindowSize:         60 * time.Second,
+		GossipInterval:     500 * time.Millisecond,
+		SuspectTimeout:     1 * time.Second,
+		PingTimeout:        2 * time.Second,
+		Fanout:             3,
+		RateLimit:          1000,
+		SoftThresholdRatio: softThresholdRatio,
 	}
 
 	server := node.NewRateLimiterServer(cfg)

@@ -5,15 +5,19 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sakthivel-p-cse/crdt-rate-limiter/crdt"
 	"github.com/sakthivel-p-cse/crdt-rate-limiter/gossip"
 	pb "github.com/sakthivel-p-cse/crdt-rate-limiter/proto"
+	"github.com/sakthivel-p-cse/crdt-rate-limiter/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 type RateLimiterServer struct {
@@ -22,6 +26,14 @@ type RateLimiterServer struct {
 
 	mu      sync.RWMutex
 	windows map[string]*crdt.EpochWindow
+	shedder TierShedder
+	budget  *AdaptiveBudget
+
+	contributedToOvershoot atomic.Bool
+	utilizationMu          sync.RWMutex
+	clientUtilization      map[string]utilizationState
+	utilizationChanged     chan struct{}
+	epochWG                sync.WaitGroup
 
 	transport       *gossip.Transport
 	membership      *gossip.Membership
@@ -35,10 +47,21 @@ type RateLimiterServer struct {
 	stopped         bool
 }
 
+type utilizationState struct {
+	ratio   float64
+	version uint64
+}
+
 func NewRateLimiterServer(cfg Config, dialOpts ...grpc.DialOption) *RateLimiterServer {
+	if cfg.SoftThresholdRatio == 0 {
+		cfg.SoftThresholdRatio = 0.70
+	}
 	s := &RateLimiterServer{
-		config:  cfg,
-		windows: make(map[string]*crdt.EpochWindow),
+		config:             cfg,
+		windows:            make(map[string]*crdt.EpochWindow),
+		budget:             NewAdaptiveBudget(cfg.RateLimit),
+		clientUtilization:  make(map[string]utilizationState),
+		utilizationChanged: make(chan struct{}, 1),
 	}
 
 	s.transport = gossip.NewTransport(dialOpts...)
@@ -94,10 +117,64 @@ func (s *RateLimiterServer) Allow(ctx context.Context, req *pb.AllowRequest) (*p
 	}
 	start := time.Now()
 	window := s.getWindow(req.ClientId)
-	allowed, remaining := window.AllowAndIncrement(s.config.NodeID, s.config.RateLimit, req.Cost, time.Now())
+	now := time.Now()
+	limit := s.budget.Current()
+	currentCount := window.Total(now)
+	utilizationRatio := ratio(currentCount, limit)
+	s.raiseClientUtilization(req.ClientId, utilizationRatio)
+	priority := priorityFromProto(req.Priority)
+
+	if s.shedder.ShouldShed(priority, utilizationRatio) {
+		RecordAllow(s.config.NodeID, false, time.Since(start))
+		s.recordClientOvershootMetric(req.ClientId, window)
+		return s.rejectedResponse(limit-currentCount, "priority_tier_shed"), nil
+	}
+
+	softThreshold := int64(float64(limit) * s.config.SoftThresholdRatio)
+	if rand.Float64() < RejectProbability(currentCount, softThreshold, limit) {
+		RecordAllow(s.config.NodeID, false, time.Since(start))
+		s.recordClientOvershootMetric(req.ClientId, window)
+		return s.rejectedResponse(limit-currentCount, "soft_shed_probabilistic"), nil
+	}
+
+	allowed, remaining := window.AllowAndIncrement(s.config.NodeID, limit, req.Cost, now)
 	RecordAllow(s.config.NodeID, allowed, time.Since(start))
 	s.recordClientOvershootMetric(req.ClientId, window)
-	return &pb.AllowResponse{Allowed: allowed, Remaining: remaining}, nil
+	if !allowed {
+		s.raiseClientUtilization(req.ClientId, ratio(limit-remaining, limit))
+		return s.rejectedResponse(remaining, "limit_exceeded"), nil
+	}
+	s.raiseClientUtilization(req.ClientId, ratio(limit-remaining, limit))
+	return &pb.AllowResponse{Allowed: true, Remaining: remaining}, nil
+}
+
+func priorityFromProto(priority pb.Priority) Priority {
+	switch priority {
+	case pb.Priority_PRIORITY_CRITICAL:
+		return PriorityCritical
+	case pb.Priority_PRIORITY_BEST_EFFORT:
+		return PriorityBestEffort
+	default:
+		return PriorityStandard
+	}
+}
+
+func ratio(currentCount, limit int64) float64 {
+	if limit <= 0 {
+		return 1
+	}
+	return float64(currentCount) / float64(limit)
+}
+
+func (s *RateLimiterServer) rejectedResponse(remaining int64, reason string) *pb.AllowResponse {
+	interval := gossip.GossipInterval(s.config.GossipInterval, s.UtilizationRatio())
+	retryAfter := EstimatedRetryAfter(interval, gossip.ConvergenceRounds)
+	return &pb.AllowResponse{
+		Allowed:    false,
+		Remaining:  remaining,
+		Reason:     reason,
+		RetryAfter: durationpb.New(retryAfter),
+	}
 }
 
 func (s *RateLimiterServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
@@ -225,19 +302,28 @@ func (s *RateLimiterServer) GossipState(_ context.Context, req *pb.GossipRequest
 func (s *RateLimiterServer) recordOvershootMetric() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	contributed := false
+	limit := s.budget.Current()
 	for clientID, window := range s.windows {
-		s.recordClientOvershootMetric(clientID, window)
+		total, clientContributed := s.recordClientOvershootMetric(clientID, window)
+		contributed = contributed || clientContributed
+		s.raiseClientUtilization(clientID, ratio(total, limit))
+	}
+	if contributed {
+		s.contributedToOvershoot.Store(true)
 	}
 }
 
-func (s *RateLimiterServer) recordClientOvershootMetric(clientID string, window *crdt.EpochWindow) {
-	total := window.Total(time.Now())
+func (s *RateLimiterServer) recordClientOvershootMetric(clientID string, window *crdt.EpochWindow) (int64, bool) {
+	now := time.Now()
+	total := window.Total(now)
 	if s.config.RateLimit > 0 && total > s.config.RateLimit {
-		ratio := float64(total-s.config.RateLimit) / float64(s.config.RateLimit)
-		SetOvershoot(s.config.NodeID, clientID, ratio)
-		return
+		overshootRatio := float64(total-s.config.RateLimit) / float64(s.config.RateLimit)
+		SetOvershoot(s.config.NodeID, clientID, overshootRatio)
+		return total, window.ContributedInPreviousEpoch(s.config.NodeID, now)
 	}
 	SetOvershoot(s.config.NodeID, clientID, 0)
+	return total, false
 }
 
 func (s *RateLimiterServer) Start(ctx context.Context) error {
@@ -280,6 +366,7 @@ func (s *RateLimiterServer) Start(ctx context.Context) error {
 	s.started = true
 	s.swim.Start(runCtx)
 	s.disseminator.Start(runCtx)
+	s.startEpochLoop(runCtx)
 
 	if err := s.swim.Join(s.config.Peers); err != nil {
 		slog.Warn("cluster join encountered errors", "node", s.config.NodeID, "err", err)
@@ -303,6 +390,7 @@ func (s *RateLimiterServer) Stop() {
 	}
 	s.swim.Stop()
 	s.disseminator.Stop()
+	s.epochWG.Wait()
 	s.swim.Leave()
 	s.transport.Close()
 	if s.grpcServer != nil {
@@ -332,4 +420,88 @@ func (s *RateLimiterServer) Windows() map[string]*crdt.EpochWindow {
 		out[k] = v
 	}
 	return out
+}
+
+func (s *RateLimiterServer) startEpochLoop(ctx context.Context) {
+	s.epochWG.Add(1)
+	go util.SafeGo("adaptive-budget-epoch-loop", func() {
+		defer s.epochWG.Done()
+		untilNextEpoch := s.config.EpochSize - time.Duration(time.Now().UnixNano()%int64(s.config.EpochSize))
+		timer := time.NewTimer(untilNextEpoch)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				s.budget.OnEpochComplete(s.contributedToOvershoot.Swap(false))
+				s.refreshUtilizationRatios()
+				timer.Reset(s.config.EpochSize)
+			}
+		}
+	})
+}
+
+func (s *RateLimiterServer) raiseClientUtilization(clientID string, utilizationRatio float64) {
+	s.utilizationMu.Lock()
+	state := s.clientUtilization[clientID]
+	state.version++
+	changed := utilizationRatio > state.ratio
+	if changed {
+		state.ratio = utilizationRatio
+	}
+	s.clientUtilization[clientID] = state
+	s.utilizationMu.Unlock()
+	if changed {
+		select {
+		case s.utilizationChanged <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *RateLimiterServer) UtilizationRatio() float64 {
+	s.utilizationMu.RLock()
+	defer s.utilizationMu.RUnlock()
+	var maximum float64
+	for _, state := range s.clientUtilization {
+		maximum = max(maximum, state.ratio)
+	}
+	return maximum
+}
+
+func (s *RateLimiterServer) UtilizationChanges() <-chan struct{} {
+	return s.utilizationChanged
+}
+
+func (s *RateLimiterServer) refreshUtilizationRatios() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	limit := s.budget.Current()
+	now := time.Now()
+	for clientID, window := range s.windows {
+		s.utilizationMu.RLock()
+		version := s.clientUtilization[clientID].version
+		s.utilizationMu.RUnlock()
+		utilizationRatio := ratio(window.Total(now), limit)
+		s.utilizationMu.Lock()
+		state := s.clientUtilization[clientID]
+		changed := false
+		if state.version == version {
+			changed = state.ratio != utilizationRatio
+			state.ratio = utilizationRatio
+			s.clientUtilization[clientID] = state
+		}
+		s.utilizationMu.Unlock()
+		if changed {
+			select {
+			case s.utilizationChanged <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func (s *RateLimiterServer) CurrentBudget() int64 {
+	return s.budget.Current()
 }

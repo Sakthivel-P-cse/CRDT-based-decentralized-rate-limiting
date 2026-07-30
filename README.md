@@ -87,6 +87,7 @@ Environment variables:
 | `PING_TIMEOUT` | `2s` | Ping request timeout |
 | `FANOUT` | `3` | Gossip fanout |
 | `RATE_LIMIT` | `1000` | Requests per window |
+| `SOFT_THRESHOLD_RATIO` | `0.70` | Utilization ratio where probabilistic rejection begins |
 
 ## gRPC API
 
@@ -100,11 +101,14 @@ service RateLimiter {
 message AllowRequest {
   string client_id = 1;
   int64 cost = 2;
+  Priority priority = 3;
 }
 
 message AllowResponse {
   bool allowed = 1;
   int64 remaining = 2;
+  string reason = 3;
+  google.protobuf.Duration retry_after = 4;
 }
 ```
 
@@ -117,9 +121,21 @@ client := pb.NewRateLimiterClient(conn)
 resp, _ := client.Allow(ctx, &pb.AllowRequest{
     ClientId: "user-123",
     Cost:     1,
+    Priority: pb.Priority_PRIORITY_STANDARD,
 })
 fmt.Printf("Allowed: %v, Remaining: %d\n", resp.Allowed, resp.Remaining)
 ```
+
+## Gradual Degradation
+
+V2 keeps decisions local and adds four ways to reduce overload progressively:
+
+- Priority tiering protects Critical requests longest, sheds Best Effort traffic from 70% utilization, and begins shedding Standard traffic from 90%.
+- Probabilistic soft rejection starts at 70% of the current adaptive budget by default and increases linearly toward the hard limit, smoothing aggregate rejection instead of creating one abrupt boundary.
+- AIMD adaptive budgets halve when merged gossip shows that a node contributed to an overshoot in the previous epoch, then regrow by 5% per clean epoch up to the original configured limit.
+- Adaptive gossip shortens dissemination intervals as utilization rises, with a 20% floor that improves convergence without allowing a gossip storm.
+
+Rejected requests report their exact decision reason and a Retry-After duration based on the current adaptive gossip interval, four convergence rounds, and a 50ms safety margin. These mechanisms preserve the system's original availability-first philosophy: every node still decides independently during partitions, and the added controls reduce overload and overshoot rather than replacing availability with strict coordination.
 
 ## Benchmarking
 
@@ -243,7 +259,6 @@ The formula accounts for each node acting independently during four gossip round
 - [ ] Raft-based strong consistency mode
 - [ ] Kubernetes operator
 - [ ] Multi-datacenter replication
-- [ ] Adaptive gossip intervals
 - [ ] Client-side rate limit hints
 
 ## License

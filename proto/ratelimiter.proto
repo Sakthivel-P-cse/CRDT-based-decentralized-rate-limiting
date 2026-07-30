@@ -4,11 +4,17 @@ package ratelimiter;
 
 option go_package = "github.com/sakthivel-p-cse/crdt-rate-limiter/proto";
 
-service RateLimiter {
-  // Existing client-facing Allow check
-  rpc Allow(AllowRequest) returns (AllowResponse);
+import "google/protobuf/duration.proto";
 
-  // Gossip/membership endpoints
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_CRITICAL = 1;
+  PRIORITY_STANDARD = 2;
+  PRIORITY_BEST_EFFORT = 3;
+}
+
+service RateLimiter {
+  rpc Allow(AllowRequest) returns (AllowResponse);
   rpc Ping(PingRequest) returns (PingResponse);
   rpc GossipState(GossipRequest) returns (GossipResponse);
 }
@@ -16,21 +22,19 @@ service RateLimiter {
 message AllowRequest {
   string client_id = 1;
   int64 cost = 2;
+  Priority priority = 3;
 }
 
 message AllowResponse {
   bool allowed = 1;
   int64 remaining = 2;
+  string reason = 3;
+  google.protobuf.Duration retry_after = 4;
 }
 
-// MemberInfo is a compact membership digest entry piggybacked on Ping/Ack
-// payloads for SWIM-style transitive discovery. On receive, the recipient
-// merges each entry into its local membership table using incarnation-number
-// gating to avoid resurrecting dead nodes from stale gossip.
 message MemberInfo {
   string node_id     = 1;
   string address     = 2;
-  // status maps to gossip.Status: 0=Alive, 1=Suspect, 2=Dead
   int32  status      = 3;
   int32  incarnation = 4;
 }
@@ -38,22 +42,17 @@ message MemberInfo {
 message PingRequest {
   string node_id        = 1;
   string listen_address = 2;
-  // members carries a bounded subset of the sender's membership table,
-  // enabling transitive peer discovery without a dedicated gossip RPC.
   repeated MemberInfo members = 3;
   string target_node_id = 4;
 }
 
 message PingResponse {
   bool ack = 1;
-  // members carries the responder's membership digest back to the pinger.
   repeated MemberInfo members = 2;
 }
 
 message GossipRequest {
   string source_node_id = 1;
-  // State is a map of client_id -> (epoch -> (node_id -> count))
-  // We can represent this efficiently. Let's use nested maps for simplicity.
   map<string, ClientState> state = 2;
 }
 
