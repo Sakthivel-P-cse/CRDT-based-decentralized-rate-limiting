@@ -14,8 +14,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-// mockStateProvider is a StateProvider backed by a simple window map.
-// It lives here, local to the test file that uses it.
 type mockStateProvider struct {
 	windows map[string]*crdt.EpochWindow
 }
@@ -30,7 +28,6 @@ func (m *mockStateProvider) GenerateDelta(since time.Time) map[string]*pb.Client
 	return out
 }
 
-// gossipCapture is a minimal gRPC server that records the last GossipState call.
 type gossipCapture struct {
 	pb.UnimplementedRateLimiterServer
 	mu  sync.Mutex
@@ -96,4 +93,15 @@ func TestDisseminator_DeltaGenerationAndTick(t *testing.T) {
 	cs, ok := got.State["client-1"]
 	assert.True(t, ok)
 	assert.NotEmpty(t, cs.Epochs)
+}
+
+func TestDisseminator_LastSentMonotonic(t *testing.T) {
+	d := NewDisseminator("node", NewTransport(), NewMembership(), &mockStateProvider{}, time.Second)
+	d.advanceLastSent("peer", 20)
+	d.advanceLastSent("peer", 10)
+
+	d.mu.Lock()
+	got := d.lastSentNs["peer"]
+	d.mu.Unlock()
+	assert.Equal(t, int64(20), got)
 }

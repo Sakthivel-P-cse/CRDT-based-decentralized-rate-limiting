@@ -4,45 +4,83 @@ A production-grade, decentralized rate limiter built with CRDTs (Conflict-free R
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph YourModel[CRDT-Based Decentralized Rate Limiter]
+        C2[Client Services] --> LB2[Load Balancer]
+        LB2 --> N1[Rate Limiter Node 1]
+        LB2 --> N2[Rate Limiter Node 2]
+        LB2 --> N3[Rate Limiter Node 3]
+
+        subgraph Node1[Node 1]
+            G1[gRPC API] --> D1[Local decision path]
+            D1 --> T1[Tier shedding]
+            T1 --> P1[Probabilistic soft rejection]
+            P1 --> W1[Sliding epoch window]
+            W1 --> CR1[G-Counter CRDT]
+            A1[AIMD adaptive budget] -.-> D1
+            D1 --> R1[AllowResponse<br/>reason + Retry-After]
+        end
+
+        subgraph Node2[Node 2]
+            G2[gRPC API] --> D2[Local decision path]
+            D2 --> T2[Tier shedding]
+            T2 --> P2[Probabilistic soft rejection]
+            P2 --> W2[Sliding epoch window]
+            W2 --> CR2[G-Counter CRDT]
+            A2[AIMD adaptive budget] -.-> D2
+            D2 --> R2[AllowResponse<br/>reason + Retry-After]
+        end
+
+        subgraph Node3[Node 3]
+            G3[gRPC API] --> D3[Local decision path]
+            D3 --> T3[Tier shedding]
+            T3 --> P3[Probabilistic soft rejection]
+            P3 --> W3[Sliding epoch window]
+            W3 --> CR3[G-Counter CRDT]
+            A3[AIMD adaptive budget] -.-> D3
+            D3 --> R3[AllowResponse<br/>reason + Retry-After]
+        end
+
+        N1 --> Node1
+        N2 --> Node2
+        N3 --> Node3
+
+        CR1 <-->|Delta gossip<br/>periodic full sync| CR2
+        CR2 <-->|Delta gossip<br/>periodic full sync| CR3
+        CR3 <-->|Delta gossip<br/>periodic full sync| CR1
+
+        N1 <-->|SWIM membership<br/>failure detection| N2
+        N2 <-->|SWIM membership<br/>failure detection| N3
+        N3 <-->|SWIM membership<br/>failure detection| N1
+
+        M[Prometheus Metrics] -.-> N1
+        M -.-> N2
+        M -.-> N3
+    end
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Request                            │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      RateLimiterServer                           │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │  gRPC API   │  │ EpochWindow │  │      CRDT State         │  │
-│  │  (Allow)    │──▶│ (Sliding)   │──▶│  G-Counter per Epoch    │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-         ┌─────────────────┐       ┌─────────────────┐
-         │  SWIM Membership│       │  Delta Gossip   │
-         │  (Failure Det)  │       │  (State Sync)   │
-         └─────────────────┘       └─────────────────┘
-                    │                       │
-                    └───────────┬───────────┘
-                                ▼
-                    ┌─────────────────────┐
-                    │   Peer Nodes        │
-                    │  (gRPC Mesh)        │
-                    └─────────────────────┘
+
+Each node makes the Allow decision locally. A request first uses the current epoch-window total and adaptive budget to calculate utilization, then applies priority shedding and probabilistic rejection before touching the counter. Successful requests increment only the local node's component of the G-Counter.
+
+Gossip shares data in the following shape:
+
+```text
+client_id -> epoch -> node_id -> count
 ```
+
+The disseminator sends deltas to three reachable peers, advances a peer's delta watermark only after a successful send, and sends a full state periodically for repair. A receiving node merges each `(epoch, node_id)` value with a maximum operation, so duplicate or out-of-order messages are safe. SWIM separately maintains the peer membership and piggybacks membership information on ping traffic.
 
 ## Features
 
 - **CRDT-based**: G-Counter per epoch for mergeable state
 - **Decentralized**: No single point of failure, no Redis required
 - **Partition Tolerant**: AP system - serves requests during partitions
-- **SWIM Membership**: Failure detection with suspicion mechanism
-- **Delta Gossip**: Efficient state synchronization
+- **SWIM Membership**: Failure detection with suspicion mechanism and membership piggybacking
+- **Delta Gossip**: Efficient state synchronization with retry-on-failure
+- **Proportional Sliding Window**: Oldest epoch weighted by actual time overlap
 - **gRPC API**: Language-agnostic client support
 - **Observability**: Prometheus metrics, structured logging
-- **Benchmarking**: Redis baseline comparison included
+- **Benchmarking**: Comparison vs Redis (see fairness note below)
 
 ## Quick Start
 
@@ -67,7 +105,7 @@ go build ./cmd/node/
 NODE_ID=node-1 ./rate-limiter
 
 # Run with peers
-NODE_ID=node-1 PEERS=localhost:50052,localhost:50053 ./rate-limiter
+NODE_ID=node-1 LISTEN_ADDR=:50051 METRICS_ADDR=:9091 PEERS=localhost:50052,localhost:50053 go run ./cmd/node/main.go
 ```
 
 ## Configuration
@@ -86,6 +124,7 @@ Environment variables:
 | `PING_TIMEOUT` | `2s` | Ping request timeout |
 | `FANOUT` | `3` | Gossip fanout |
 | `RATE_LIMIT` | `1000` | Requests per window |
+| `SOFT_THRESHOLD_RATIO` | `0.70` | Utilization ratio where probabilistic rejection begins |
 
 ## gRPC API
 
@@ -99,11 +138,14 @@ service RateLimiter {
 message AllowRequest {
   string client_id = 1;
   int64 cost = 2;
+  Priority priority = 3;
 }
 
 message AllowResponse {
   bool allowed = 1;
   int64 remaining = 2;
+  string reason = 3;
+  google.protobuf.Duration retry_after = 4;
 }
 ```
 
@@ -116,13 +158,28 @@ client := pb.NewRateLimiterClient(conn)
 resp, _ := client.Allow(ctx, &pb.AllowRequest{
     ClientId: "user-123",
     Cost:     1,
+    Priority: pb.Priority_PRIORITY_STANDARD,
 })
 fmt.Printf("Allowed: %v, Remaining: %d\n", resp.Allowed, resp.Remaining)
 ```
 
+## Gradual Degradation
+
+V2 keeps decisions local and adds four ways to reduce overload progressively:
+
+- Priority tiering protects Critical requests longest, sheds Best Effort traffic from 70% utilization, and begins shedding Standard traffic from 90%.
+- Probabilistic soft rejection starts at 70% of the current adaptive budget by default and increases linearly toward the hard limit, smoothing aggregate rejection instead of creating one abrupt boundary.
+- AIMD adaptive budgets halve when merged gossip shows that a node contributed to an overshoot in the previous epoch, then regrow by 5% per clean epoch up to the original configured limit.
+- Adaptive gossip shortens dissemination intervals as utilization rises, with a 20% floor that improves convergence without allowing a gossip storm.
+
+Rejected requests report their exact decision reason and a Retry-After duration based on the current adaptive gossip interval, four convergence rounds, and a 50ms safety margin. These mechanisms preserve the system's original availability-first philosophy: every node still decides independently during partitions, and the added controls reduce overload and overshoot rather than replacing availability with strict coordination.
+
 ## Benchmarking
 
 ### Redis Baseline
+
+> **⚠️ Fairness Note**: The Redis baseline uses a **fixed-window** centralized limiter (not a sliding window). The CRDT cluster uses a **proportional sliding window**. These are different algorithms with different accuracy characteristics. The Redis comparison shows operational trade-offs (SPOF, network path, algorithmic differences), NOT an apples-to-apples algorithmic comparison. Latency differences reflect both the algorithm AND the network path.
+
 ```bash
 go run ./benchmark -mode=redis -redis=localhost:6379 -rps=10000 -duration=30s
 ```
@@ -145,9 +202,12 @@ Expose metrics on `:9090/metrics`:
 |--------|------|-------------|
 | `ratelimit_allow_total` | Counter | Total allow requests by result |
 | `ratelimit_decision_latency_seconds` | Histogram | Decision latency |
-| `gossip_round_latency_seconds` | Histogram | Gossip round latency |
-| `gossip_convergence_seconds` | Histogram | Convergence time after heal |
+
+| `gossip_payload_processing_seconds` | Histogram | Latency of gossip payload processing |
 | `ratelimit_estimated_overshoot` | Gauge | Estimated overshoot ratio |
+| `ratelimit_active_clients` | Gauge | Number of active clients |
+
+All metrics are wired to actual call sites and recorded at runtime.
 
 ## Testing
 
@@ -158,6 +218,19 @@ go test -race ./...
 # Specific packages
 go test -race ./crdt/...
 go test -race ./gossip/...
+
+# Transitive membership discovery (Phase 1)
+go test -race ./gossip/ -run TestTransitiveMembershipDiscovery -v
+
+# GetAll race safety + shuffle uniformity (Phase 3)
+go test -race ./gossip/ -run TestMembership_GetAll_Race -v
+go test -race ./gossip/ -run TestMembership_ShuffleUniform -v
+
+# Proportional sliding window semantics (Phase 4)
+go test -race ./crdt/ -run TestEpochWindow_ProportionalOldestBucket -v
+
+# Accuracy benchmark — no fudge factor (Phase 5)
+go test -timeout 120s ./benchmark/ -run TestOvershootValidation -v
 ```
 
 ## Design Decisions
@@ -165,22 +238,26 @@ go test -race ./gossip/...
 ### CRDT Choice: G-Counter
 - **Grow-only**: Natural fit for request counting
 - **Commutative/Associative/Idempotent**: Mathematically proven merge
-- **Delta-friendly**: Only send increments since last sync
+- **Delta-friendly**: Only send increments since last sync (with retry on failure)
 
-### Sliding Window with Epochs
-- Epoch = 1 second, Window = 60 epochs (1 minute)
-- Automatic GC of expired epochs
-- O(epochs) memory per client
+### Proportional Sliding Window with Epochs
+- Epoch = configurable (default 1s), Window = configurable (default 60s)
+- Oldest bucket scaled by `overlap_fraction = (epoch_end − window_start) / epoch_size`
+- This implements true proportional sliding-window semantics, not fixed-epoch overcounting
+- Automatic GC of expired epochs; O(epochs) memory per client
 
-### SWIM-lite Membership
-- Direct ping with indirect fallback
-- Suspicion mechanism reduces false positives
-- Incarnation numbers handle restarts
+### SWIM Membership with Piggybacking
+- Direct ping with indirect fallback for failure detection
+- **Membership digest piggybacked on every Ping/Ack payload** for transitive discovery:
+  - Node A seeds only B; B seeds only C → after 1-2 ping rounds, A learns about C
+  - No separate gossip RPC for membership; uses existing ping traffic
+- Incarnation-number gating prevents stale gossip from resurrecting dead nodes
+- Gossip dissemination targets Alive+Suspect peers (not only Alive), ensuring recovery after partitions
 
 ### Gossip Protocol
-- Fanout = 3 (configurable)
-- Delta state with periodic full sync
-- Per-peer epoch tracking for efficiency
+- Fanout = 3 (configurable), targeting Alive+Suspect peers
+- Delta state with periodic full sync; only advances per-peer clock on *successful* send
+- Per-goroutine context deadline (3× tick interval) to prevent goroutine leaks on network stalls
 
 ## CAP Trade-offs
 
@@ -190,9 +267,28 @@ go test -race ./gossip/...
 | **Availability** | Full during partitions |
 | **Partition Tolerance** | Yes |
 
-**Overshoot Bound**: `max_overshoot ≈ (num_nodes - 1) × local_request_rate × gossip_interval`
+### Overshoot Bound
 
-Example: 5 nodes, 500ms gossip interval, 50 req/s local rate per node → max 100 requests overshoot globally before convergence.
+The formula verified by `TestOvershootValidation` is:
+
+```
+max_overshoot ≤ N × local_request_rate × gossip_interval × convergence_rounds
+```
+
+Where:
+- `N` = number of nodes
+- `local_request_rate` = requests per second per node (at the limit boundary)
+- `gossip_interval` = gossip tick period
+- `convergence_rounds` = 4 for the benchmark's N=3, fanout=2 configuration
+
+**Example** (3 nodes, fanout=2, gossip_interval=500ms, 50 req/s per node):
+```
+max_overshoot ≤ 3 × 50 × 0.5 × 4 = 300 requests globally
+```
+
+The formula accounts for each node acting independently during four gossip rounds before full convergence.
+
+> **Note**: The proportional sliding-window implementation means the *effective* request rate counted by each node at the limit boundary is the weighted sum over the window — which correctly accounts for epoch boundaries and avoids both over- and under-counting.
 
 ## Future Work
 
@@ -200,7 +296,6 @@ Example: 5 nodes, 500ms gossip interval, 50 req/s local rate per node → max 10
 - [ ] Raft-based strong consistency mode
 - [ ] Kubernetes operator
 - [ ] Multi-datacenter replication
-- [ ] Adaptive gossip intervals
 - [ ] Client-side rate limit hints
 
 ## License

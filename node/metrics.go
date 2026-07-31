@@ -2,6 +2,9 @@ package node
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sakthivel-p-cse/crdt-rate-limiter/util"
 )
 
 var (
@@ -23,22 +27,16 @@ var (
 		Buckets: prometheus.DefBuckets,
 	}, []string{"node"})
 
-	gossipRoundLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "gossip_round_latency_seconds",
-		Help:    "Latency of gossip rounds",
-		Buckets: prometheus.DefBuckets,
-	}, []string{"node"})
-
-	gossipConvergence = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "gossip_convergence_seconds",
-		Help:    "Time to convergence after partition heal",
+	gossipPayloadProcessing = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gossip_payload_processing_seconds",
+		Help:    "Latency of gossip payload processing",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"node"})
 
 	estimatedOvershoot = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ratelimit_estimated_overshoot",
 		Help: "Estimated overshoot ratio",
-	}, []string{"node"})
+	}, []string{"node", "client_id"})
 
 	activeClients = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ratelimit_active_clients",
@@ -47,9 +45,10 @@ var (
 )
 
 type MetricsServer struct {
-	nodeID string
-	server *http.Server
-	mu     sync.Mutex
+	nodeID   string
+	server   *http.Server
+	mu       sync.Mutex
+	listener net.Listener
 }
 
 func NewMetricsServer(nodeID, addr string) *MetricsServer {
@@ -68,16 +67,32 @@ func NewMetricsServer(nodeID, addr string) *MetricsServer {
 }
 
 func (m *MetricsServer) Start() error {
-	go func() {
-		if err := m.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			panic(err)
+	m.mu.Lock()
+	if m.listener != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("metrics server already started")
+	}
+	listener, err := net.Listen("tcp", m.server.Addr)
+	if err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.listener = listener
+	m.mu.Unlock()
+	go util.SafeGo("metrics-server", func() {
+		if err := m.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Error("Metrics server failed to start", "error", err)
 		}
-	}()
+	})
 	return nil
 }
 
 func (m *MetricsServer) Stop(ctx context.Context) error {
-	return m.server.Shutdown(ctx)
+	err := m.server.Shutdown(ctx)
+	m.mu.Lock()
+	m.listener = nil
+	m.mu.Unlock()
+	return err
 }
 
 func RecordAllow(nodeID string, allowed bool, latency time.Duration) {
@@ -89,16 +104,12 @@ func RecordAllow(nodeID string, allowed bool, latency time.Duration) {
 	decisionLatency.WithLabelValues(nodeID).Observe(latency.Seconds())
 }
 
-func RecordGossipRound(nodeID string, latency time.Duration) {
-	gossipRoundLatency.WithLabelValues(nodeID).Observe(latency.Seconds())
+func RecordPayloadProcessing(nodeID string, latency time.Duration) {
+	gossipPayloadProcessing.WithLabelValues(nodeID).Observe(latency.Seconds())
 }
 
-func RecordConvergence(nodeID string, latency time.Duration) {
-	gossipConvergence.WithLabelValues(nodeID).Observe(latency.Seconds())
-}
-
-func SetOvershoot(nodeID string, ratio float64) {
-	estimatedOvershoot.WithLabelValues(nodeID).Set(ratio)
+func SetOvershoot(nodeID string, clientID string, ratio float64) {
+	estimatedOvershoot.WithLabelValues(nodeID, clientID).Set(ratio)
 }
 
 func SetActiveClients(nodeID string, count int) {

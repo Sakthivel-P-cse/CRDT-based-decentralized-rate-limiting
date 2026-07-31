@@ -27,14 +27,13 @@ func TestGCounter_Merge(t *testing.T) {
 
 	c1.Merge(c2)
 
-	// expected max per slot: nodeA:5, nodeB:8, nodeC:2 -> total 15
 	if val := c1.Value(); val != 15 {
 		t.Fatalf("expected 15, got %d", val)
 	}
 }
 
 func TestGCounter_CommutativeAssociativeIdempotent(t *testing.T) {
-	// Generate random vectors and test properties
+
 	gen := func(seed int64) *GCounter {
 		r := rand.New(rand.NewSource(seed))
 		c := NewGCounter()
@@ -48,14 +47,12 @@ func TestGCounter_CommutativeAssociativeIdempotent(t *testing.T) {
 	c2 := gen(2)
 	c3 := gen(3)
 
-	// Idempotency: Merge(A, A) == A
 	c1Copy := gen(1)
 	c1Copy.Merge(c1)
 	if c1Copy.Value() != c1.Value() {
 		t.Fatal("Idempotency failed")
 	}
 
-	// Commutativity: Merge(A, B) == Merge(B, A)
 	c1Copy2 := gen(1)
 	c1Copy2.Merge(c2)
 
@@ -66,7 +63,6 @@ func TestGCounter_CommutativeAssociativeIdempotent(t *testing.T) {
 		t.Fatal("Commutativity failed")
 	}
 
-	// Associativity: Merge(Merge(A, B), C) == Merge(A, Merge(B, C))
 	leftGroup := gen(1)
 	leftGroup.Merge(c2)
 	leftGroup.Merge(c3)
