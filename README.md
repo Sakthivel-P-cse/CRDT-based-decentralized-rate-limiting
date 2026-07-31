@@ -4,34 +4,71 @@ A production-grade, decentralized rate limiter built with CRDTs (Conflict-free R
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph YourModel[CRDT-Based Decentralized Rate Limiter]
+        C2[Client Services] --> LB2[Load Balancer]
+        LB2 --> N1[Rate Limiter Node 1]
+        LB2 --> N2[Rate Limiter Node 2]
+        LB2 --> N3[Rate Limiter Node 3]
+
+        subgraph Node1[Node 1]
+            G1[gRPC API] --> D1[Local decision path]
+            D1 --> T1[Tier shedding]
+            T1 --> P1[Probabilistic soft rejection]
+            P1 --> W1[Sliding epoch window]
+            W1 --> CR1[G-Counter CRDT]
+            A1[AIMD adaptive budget] -.-> D1
+            D1 --> R1[AllowResponse<br/>reason + Retry-After]
+        end
+
+        subgraph Node2[Node 2]
+            G2[gRPC API] --> D2[Local decision path]
+            D2 --> T2[Tier shedding]
+            T2 --> P2[Probabilistic soft rejection]
+            P2 --> W2[Sliding epoch window]
+            W2 --> CR2[G-Counter CRDT]
+            A2[AIMD adaptive budget] -.-> D2
+            D2 --> R2[AllowResponse<br/>reason + Retry-After]
+        end
+
+        subgraph Node3[Node 3]
+            G3[gRPC API] --> D3[Local decision path]
+            D3 --> T3[Tier shedding]
+            T3 --> P3[Probabilistic soft rejection]
+            P3 --> W3[Sliding epoch window]
+            W3 --> CR3[G-Counter CRDT]
+            A3[AIMD adaptive budget] -.-> D3
+            D3 --> R3[AllowResponse<br/>reason + Retry-After]
+        end
+
+        N1 --> Node1
+        N2 --> Node2
+        N3 --> Node3
+
+        CR1 <-->|Delta gossip<br/>periodic full sync| CR2
+        CR2 <-->|Delta gossip<br/>periodic full sync| CR3
+        CR3 <-->|Delta gossip<br/>periodic full sync| CR1
+
+        N1 <-->|SWIM membership<br/>failure detection| N2
+        N2 <-->|SWIM membership<br/>failure detection| N3
+        N3 <-->|SWIM membership<br/>failure detection| N1
+
+        M[Prometheus Metrics] -.-> N1
+        M -.-> N2
+        M -.-> N3
+    end
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Request                            │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      RateLimiterServer                           │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │  gRPC API   │  │ EpochWindow │  │      CRDT State         │  │
-│  │  (Allow)    │──▶│ (Sliding)   │──▶│  G-Counter per Epoch    │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-         ┌─────────────────┐       ┌─────────────────┐
-         │  SWIM Membership│       │  Delta Gossip   │
-         │  (Failure Det)  │       │  (State Sync)   │
-         └─────────────────┘       └─────────────────┘
-                    │                       │
-                    └───────────┬───────────┘
-                                ▼
-                    ┌─────────────────────┐
-                    │   Peer Nodes        │
-                    │  (gRPC Mesh)        │
-                    └─────────────────────┘
+
+Each node makes the Allow decision locally. A request first uses the current epoch-window total and adaptive budget to calculate utilization, then applies priority shedding and probabilistic rejection before touching the counter. Successful requests increment only the local node's component of the G-Counter.
+
+Gossip shares data in the following shape:
+
+```text
+client_id -> epoch -> node_id -> count
 ```
+
+The disseminator sends deltas to three reachable peers, advances a peer's delta watermark only after a successful send, and sends a full state periodically for repair. A receiving node merges each `(epoch, node_id)` value with a maximum operation, so duplicate or out-of-order messages are safe. SWIM separately maintains the peer membership and piggybacks membership information on ping traffic.
 
 ## Features
 
